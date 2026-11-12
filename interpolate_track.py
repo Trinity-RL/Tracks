@@ -89,14 +89,24 @@ class TrackInterpolator:
         self.left_interp = build_interp(self.left_points)
         self.right_interp = build_interp(self.right_points)
 
-    def _build_wall_polylines(self, n_samples: int = 2000):
-        """Pre-sample interpolated walls into dense XZ polylines for raycasting."""
+    def _build_wall_polylines(self, n_samples: int = 2000, oversample: int = 10):
+        """Pre-sample interpolated walls into XZ polylines, evenly spaced by arc length."""
         def sample_wall(interp, max_t, n_points):
             if interp is None:
                 return None
             fx, _, fz = interp
-            ts = np.linspace(0, max_t, n_points)
-            return np.column_stack([fx(ts), fz(ts)])
+            # Densely sample in parameter space, then re-parameterize by arc length
+            # so the final points are evenly spaced by distance, not by CSV index.
+            fine_t = np.linspace(0, max_t, n_points * oversample)
+            fine_xz = np.column_stack([fx(fine_t), fz(fine_t)])
+            seg_lengths = np.linalg.norm(np.diff(fine_xz, axis=0), axis=1)
+            cum_length = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+            total_length = cum_length[-1]
+            if total_length <= 0:
+                return fine_xz[:n_points]
+            target_lengths = np.linspace(0, total_length, n_points)
+            target_t = np.interp(target_lengths, cum_length, fine_t)
+            return np.column_stack([fx(target_t), fz(target_t)])
 
         self._left_wall_xz = sample_wall(self.left_interp, len(self.left_points) - 1, n_samples)
         self._right_wall_xz = sample_wall(self.right_interp, len(self.right_points) - 1, n_samples)
@@ -127,70 +137,65 @@ class TrackInterpolator:
             return [(None, None)] * len(angles)
         fwd /= fwd_len
 
-        results = []
-        for angle_deg in angles:
-            angle_rad = np.radians(angle_deg)
-            cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-            # Rotate forward direction by angle (positive = left in XZ plane)
-            ray_dir = np.array([
-                fwd[0] * cos_a - fwd[1] * sin_a,
-                fwd[0] * sin_a + fwd[1] * cos_a,
-            ])
+        # Rotate forward direction by each angle (positive = left in XZ plane)
+        angles_rad = np.radians(angles)
+        cos_a, sin_a = np.cos(angles_rad), np.sin(angles_rad)
+        ray_x = fwd[0] * cos_a - fwd[1] * sin_a
+        ray_z = fwd[0] * sin_a + fwd[1] * cos_a
 
-            best_dist = None
-            best_side = None
+        best_dist = np.full(len(angles), np.inf)
+        best_side = [None] * len(angles)
 
-            for wall_xz, side in ((self._left_wall_xz, "left"), (self._right_wall_xz, "right")):
-                if wall_xz is None:
-                    continue
-                dist = self._ray_polyline_dist(origin, ray_dir, wall_xz, max_dist)
-                if dist is not None and (best_dist is None or dist < best_dist):
-                    best_dist = dist
-                    best_side = side
+        for wall_xz, side in ((self._left_wall_xz, "left"), (self._right_wall_xz, "right")):
+            if wall_xz is None:
+                continue
+            dists = self._rays_polyline_dist(origin, ray_x, ray_z, wall_xz, max_dist)
+            for i in np.nonzero(dists < best_dist)[0]:
+                best_dist[i] = dists[i]
+                best_side[i] = side
 
-            results.append((best_dist, best_side))
+        return [
+            (float(dist) if side is not None else None, side)
+            for dist, side in zip(best_dist, best_side)
+        ]
 
-        return results
-
-    def _ray_polyline_dist(
+    def _rays_polyline_dist(
         self,
         origin: np.ndarray,
-        direction: np.ndarray,
+        ray_x: np.ndarray,
+        ray_z: np.ndarray,
         wall_xz: np.ndarray,
         max_dist: float,
-    ) -> Optional[float]:
-        """Find nearest intersection distance of a ray with a polyline (XZ plane).
+    ) -> np.ndarray:
+        """Find each ray's nearest intersection distance with a polyline (XZ plane), inf if none.
 
-        Uses vectorized Cramer's rule across all segments simultaneously.
+        Uses vectorized Cramer's rule across all rays and segments simultaneously.
         """
         A = wall_xz[:-1]   # segment starts (N, 2)
         B = wall_xz[1:]    # segment ends   (N, 2)
         AB = B - A         # segment vectors (N, 2)
         AP = A - origin    # origin-to-segment-start (N, 2)
 
-        dx, dz = direction[0], direction[1]
+        dx, dz = ray_x[:, None], ray_z[:, None]  # (R, 1), broadcast against the segments
 
         # Cramer's rule for: O + t*d = A + s*AB
         # det = AB.x*dz - dx*AB.z
-        det = AB[:, 0] * dz - dx * AB[:, 1]
+        det = AB[:, 0] * dz - dx * AB[:, 1]  # (R, N)
 
-        mask = np.abs(det) > 1e-10
-
-        t = np.full(len(A), np.inf)
-        s = np.full(len(A), np.inf)
+        # Parallel segments (det ~ 0) divide by inf instead, giving t = s = 0;
+        # `usable` below rejects those.
+        usable = np.abs(det) > 1e-10
+        safe_det = np.where(usable, det, np.inf)
 
         # t = (AB.x*AP.z - AB.z*AP.x) / det
-        t[mask] = (AB[mask, 0] * AP[mask, 1] - AB[mask, 1] * AP[mask, 0]) / det[mask]
+        t = (AB[:, 0] * AP[:, 1] - AB[:, 1] * AP[:, 0]) / safe_det
         # s = (dx*AP.z - dz*AP.x) / det
-        s[mask] = (dx * AP[mask, 1] - dz * AP[mask, 0]) / det[mask]
+        s = (dx * AP[:, 1] - dz * AP[:, 0]) / safe_det
 
         # Valid hits: ray goes forward (t >= 0), hit is within segment (0 <= s <= 1)
-        valid = (t >= 0) & (s >= 0) & (s <= 1) & (t <= max_dist)
+        valid = usable & (t >= 0) & (s >= 0) & (s <= 1) & (t <= max_dist)
 
-        if not np.any(valid):
-            return None
-
-        return float(np.min(t[valid]))
+        return np.min(np.where(valid, t, np.inf), axis=1)
 
     def get_position(self, t: float, side: str = "left") -> Optional[Vec3]:
         """Interpolate position at parameter t (0 to len(points)-1).
